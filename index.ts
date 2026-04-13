@@ -1,34 +1,25 @@
 /**
- * Cloudflare AI Gateway Provider Extension
+ * Cloudflare Workers AI Provider Extension
  *
- * Routes Anthropic and OpenAI requests through Cloudflare AI Gateway
- * for observability, caching, rate limiting, and fallbacks.
- * Optionally adds Cloudflare Workers AI models.
- *
- * Config is read from config.json next to this file (preferred), with env var fallbacks.
+ * Dynamically fetches available text generation models from the Cloudflare API
+ * and registers them via the AI Gateway.
  *
  * config.json fields:
  *   accountId    - Your Cloudflare account ID
  *   gatewayName  - Your AI Gateway name (slug)
- *   apiToken     - Cloudflare API token (enables Workers AI models, optional)
+ *   apiToken     - Cloudflare API token
  *   gatewayToken - Gateway auth token (if gateway requires authentication, optional)
- *   skipAnthropic - true to skip overriding Anthropic (optional)
- *   skipOpenAI    - true to skip overriding OpenAI (optional)
- *   skipGoogle    - true to skip overriding Google (optional)
  *
- * Env var fallbacks (used when config.json field is empty/missing):
- *   CF_ACCOUNT_ID, CF_GATEWAY_NAME, CF_API_TOKEN,
- *   CF_GATEWAY_TOKEN, CF_GATEWAY_SKIP_ANTHROPIC,
- *   CF_GATEWAY_SKIP_OPENAI, CF_GATEWAY_SKIP_GOOGLE
+ * Env var fallbacks:
+ *   CF_ACCOUNT_ID, CF_GATEWAY_NAME, CF_API_TOKEN, CF_GATEWAY_TOKEN
  *
  * Usage:
  *   Fill in config.json, then /reload (or restart pi).
- *   All Anthropic/OpenAI/Google requests flow through your gateway.
- *   Use /model to pick a Workers AI model if apiToken is set.
+ *   Use /model to pick a Workers AI model.
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -42,9 +33,6 @@ function loadConfig() {
       gatewayName?: string;
       apiToken?: string;
       gatewayToken?: string;
-      skipAnthropic?: boolean;
-      skipOpenAI?: boolean;
-      skipGoogle?: boolean;
     };
   } catch {
     return {};
@@ -57,164 +45,138 @@ function resolve(jsonVal: string | undefined, envVar: string): string {
   return process.env[envVar] ?? "";
 }
 
-function resolveFlag(jsonVal: boolean | undefined, envVar: string): boolean {
-  if (jsonVal !== undefined) return jsonVal;
-  return process.env[envVar] === "1";
+// Models known to support reasoning/thinking mode
+const REASONING_MODELS = new Set([
+  "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+  "@cf/moonshotai/kimi-k2.5",
+]);
+
+interface CFModel {
+  name: string;
+  properties: Array<{ property_id: string; value: unknown }>;
+  schema?: {
+    input?: {
+      properties?: {
+        max_tokens?: { maximum?: number; default?: number };
+        image?: unknown;
+      };
+    };
+  };
 }
 
-// Workers AI models available through Cloudflare
-// See: https://developers.cloudflare.com/workers-ai/models/
-const FREE_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
-const BASE_COMPAT = { supportsDeveloperRole: false, maxTokensField: "max_tokens" as const };
+function mapModel(m: CFModel) {
+  const props = new Map(m.properties.map((p) => [p.property_id, p.value]));
 
-const WORKERS_AI_MODELS = [
-  {
-    id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-    name: "Llama 3.3 70B Instruct (Workers AI)",
-    reasoning: false as const,
-    input: ["text"] as ("text" | "image")[],
-    cost: FREE_COST,
-    contextWindow: 128000,
-    maxTokens: 8192,
-    compat: BASE_COMPAT,
-  },
-  {
-    id: "@cf/meta/llama-3.1-70b-instruct",
-    name: "Llama 3.1 70B Instruct (Workers AI)",
-    reasoning: false as const,
-    input: ["text"] as ("text" | "image")[],
-    cost: FREE_COST,
-    contextWindow: 128000,
-    maxTokens: 8192,
-    compat: BASE_COMPAT,
-  },
-  {
-    id: "@cf/meta/llama-3.1-8b-instruct",
-    name: "Llama 3.1 8B Instruct (Workers AI)",
-    reasoning: false as const,
-    input: ["text"] as ("text" | "image")[],
-    cost: FREE_COST,
-    contextWindow: 128000,
-    maxTokens: 4096,
-    compat: BASE_COMPAT,
-  },
-  {
-    id: "@cf/google/gemma-3-27b-it",
-    name: "Gemma 3 27B (Workers AI)",
-    reasoning: false as const,
-    input: ["text"] as ("text" | "image")[],
-    cost: FREE_COST,
-    contextWindow: 131072,
-    maxTokens: 8192,
-    compat: BASE_COMPAT,
-  },
-  {
-    id: "@cf/mistral/mistral-7b-instruct-v0.1",
-    name: "Mistral 7B Instruct (Workers AI)",
-    reasoning: false as const,
-    input: ["text"] as ("text" | "image")[],
-    cost: FREE_COST,
-    contextWindow: 32768,
-    maxTokens: 4096,
-    compat: BASE_COMPAT,
-  },
-  {
-    id: "@cf/qwen/qwen2.5-coder-32b-instruct",
-    name: "Qwen 2.5 Coder 32B (Workers AI)",
-    reasoning: false as const,
-    input: ["text"] as ("text" | "image")[],
-    cost: FREE_COST,
-    contextWindow: 32768,
-    maxTokens: 8192,
-    compat: BASE_COMPAT,
-  },
-  {
-    id: "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
-    name: "DeepSeek R1 Distill Qwen 32B (Workers AI)",
-    reasoning: true as const,
-    input: ["text"] as ("text" | "image")[],
-    cost: FREE_COST,
-    contextWindow: 32768,
-    maxTokens: 8192,
-    compat: { ...BASE_COMPAT, thinkingFormat: "openai" as const },
-  },
-  {
-    id: "@cf/moonshotai/kimi-k2.5",
-    name: "Kimi K2.5 (Workers AI)",
-    reasoning: true as const,
-    input: ["text", "image"] as ("text" | "image")[],
-    cost: { input: 0.6, output: 3.0, cacheRead: 0.1, cacheWrite: 0 },
-    contextWindow: 256000,
-    maxTokens: 32768,
-    compat: { ...BASE_COMPAT, thinkingFormat: "openai" as const },
-  },
-];
+  const contextWindow = parseInt((props.get("context_window") as string) ?? "32768", 10);
 
-export default function (pi: ExtensionAPI) {
+  const prices = props.get("price") as Array<{ unit: string; price: number }> | undefined;
+  const inputPrice = prices?.find((p) => p.unit.includes("input"))?.price ?? 0;
+  const outputPrice = prices?.find((p) => p.unit.includes("output"))?.price ?? 0;
+  const cacheReadPrice = prices?.find((p) => p.unit.includes("cache"))?.price ?? 0;
+
+  const inputProps = m.schema?.input?.properties;
+  const maxTokens =
+    inputProps?.max_tokens?.maximum ??
+    inputProps?.max_tokens?.default ??
+    Math.min(Math.floor(contextWindow / 4), 8192);
+
+  const isReasoning = REASONING_MODELS.has(m.name);
+
+  return {
+    id: m.name,
+    name: `${m.name.replace(/^@cf\//, "")} (Workers AI)`,
+    reasoning: isReasoning,
+    input: (inputProps?.image ? ["text", "image"] : ["text"]) as ("text" | "image")[],
+    cost: { input: inputPrice, output: outputPrice, cacheRead: cacheReadPrice, cacheWrite: 0 },
+    contextWindow,
+    maxTokens,
+    compat: {
+      supportsDeveloperRole: false,
+      maxTokensField: "max_tokens" as const,
+      ...(isReasoning ? { thinkingFormat: "openai" as const } : {}),
+    },
+  };
+}
+
+async function fetchTextGenerationModels(accountId: string, apiToken: string): Promise<CFModel[] | null> {
+  try {
+    const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/models/search?task=Text+Generation&per_page=100`;
+    const resp = await fetch(url, { headers: { Authorization: `Bearer ${apiToken}` } });
+    if (!resp.ok) return null;
+    const json = (await resp.json()) as { success: boolean; result: CFModel[] };
+    return json.success ? json.result : null;
+  } catch {
+    return null;
+  }
+}
+
+export default async function (pi: ExtensionAPI) {
+  pi.registerCommand("cf-setup", {
+    description: "Configure Cloudflare Workers AI (account ID, gateway, API token)",
+    handler: async (_args, ctx) => {
+      const accountId = await ctx.ui.input("Cloudflare Account ID", "f009c417...");
+      if (accountId === undefined) return;
+
+      const gatewayName = await ctx.ui.input("AI Gateway name (slug)", "my-gateway");
+      if (gatewayName === undefined) return;
+
+      const apiToken = await ctx.ui.input("Cloudflare API token", "cfut_...");
+      if (apiToken === undefined) return;
+
+      const gatewayToken = await ctx.ui.input(
+        "Gateway auth token (leave empty if not required)",
+        "optional",
+      );
+      if (gatewayToken === undefined) return;
+
+      const config = {
+        accountId: accountId.trim(),
+        gatewayName: gatewayName.trim(),
+        apiToken: apiToken.trim(),
+        gatewayToken: gatewayToken.trim(),
+      };
+
+      writeFileSync(join(__dirname, "config.json"), JSON.stringify(config, null, 2) + "\n", "utf8");
+      ctx.ui.notify("Cloudflare config saved — reloading…", "info");
+      await ctx.reload();
+    },
+  });
+
+
   const cfg = loadConfig();
 
   const accountId = resolve(cfg.accountId, "CF_ACCOUNT_ID");
   const gatewayName = resolve(cfg.gatewayName, "CF_GATEWAY_NAME");
+  const apiToken = resolve(cfg.apiToken, "CF_API_TOKEN");
 
-  if (!accountId || !gatewayName) {
-    // Silently skip — fill in config.json or set env vars to activate
+  if (!accountId || !gatewayName || !apiToken) return;
+
+  const cfModels = await fetchTextGenerationModels(accountId, apiToken);
+
+  if (!cfModels) {
+    pi.on("session_start", (_event, ctx) => {
+      ctx.ui.notify("Cloudflare Workers AI: failed to fetch model list", "error");
+    });
     return;
   }
 
   const gatewayBase = `https://gateway.ai.cloudflare.com/v1/${accountId}/${gatewayName}`;
-
   const gatewayToken = resolve(cfg.gatewayToken, "CF_GATEWAY_TOKEN");
   const extraHeaders = gatewayToken
     ? { headers: { "cf-aig-authorization": `Bearer ${gatewayToken}` } }
     : {};
 
-  const skipAnthropic = resolveFlag(cfg.skipAnthropic, "CF_GATEWAY_SKIP_ANTHROPIC");
-  const skipOpenAI = resolveFlag(cfg.skipOpenAI, "CF_GATEWAY_SKIP_OPENAI");
-  const skipGoogle = resolveFlag(cfg.skipGoogle, "CF_GATEWAY_SKIP_GOOGLE");
-  const apiToken = resolve(cfg.apiToken, "CF_API_TOKEN");
+  pi.registerProvider("cloudflare-workers-ai", {
+    baseUrl: `${gatewayBase}/workers-ai/v1`,
+    apiKey: apiToken,
+    api: "openai-completions",
+    authHeader: true,
+    ...extraHeaders,
+    models: cfModels.map(mapModel),
+  });
 
-  const activeProviders: string[] = [];
-
-  // ─── Route Anthropic through the gateway ──────────────────────────────────
-  if (!skipAnthropic) {
-    pi.registerProvider("anthropic", { baseUrl: `${gatewayBase}/anthropic`, ...extraHeaders });
-    activeProviders.push("Anthropic");
-  }
-
-  // ─── Route OpenAI through the gateway ─────────────────────────────────────
-  if (!skipOpenAI) {
-    pi.registerProvider("openai", { baseUrl: `${gatewayBase}/openai`, ...extraHeaders });
-    activeProviders.push("OpenAI");
-  }
-
-  // ─── Route Google through the gateway ─────────────────────────────────────
-  if (!skipGoogle) {
-    pi.registerProvider("google", { baseUrl: `${gatewayBase}/google-ai-studio`, ...extraHeaders });
-    activeProviders.push("Google");
-  }
-
-  // ─── Cloudflare Workers AI models (optional) ──────────────────────────────
-  // Only registered when apiToken is set.
-  // Workers AI is OpenAI-compatible through the gateway at:
-  //   https://gateway.ai.cloudflare.com/v1/{account}/{gateway}/workers-ai/v1
-  if (apiToken) {
-    pi.registerProvider("cloudflare-workers-ai", {
-      baseUrl: `${gatewayBase}/workers-ai/v1`,
-      apiKey: apiToken,
-      api: "openai-completions",
-      authHeader: true,
-      ...extraHeaders,
-      models: WORKERS_AI_MODELS,
-    });
-    activeProviders.push("Workers AI");
-  }
-
-  const activeProvidersLabel = activeProviders.join(", ");
-
+  const modelCount = cfModels.length;
   pi.on("session_start", (_event, ctx) => {
-    ctx.ui.notify(
-      `Cloudflare AI Gateway active (${gatewayName}): ${activeProvidersLabel}`,
-      "info",
-    );
+    ctx.ui.notify(`Cloudflare Workers AI active (${gatewayName}): ${modelCount} models`, "info");
   });
 }

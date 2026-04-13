@@ -2,8 +2,5 @@
   "accountId": "your-cloudflare-account-id",
   "gatewayName": "your-ai-gateway-slug",
   "apiToken": "your-cloudflare-api-token",
-  "gatewayToken": "your-gateway-auth-token",
-  "skipAnthropic": false,
-  "skipOpenAI": false,
-  "skipGoogle": false
+  "gatewayToken": "your-gateway-auth-token"
 }
