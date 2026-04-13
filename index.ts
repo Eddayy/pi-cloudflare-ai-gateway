@@ -111,7 +111,7 @@ async function fetchTextGenerationModels(accountId: string, apiToken: string): P
 }
 
 export default async function (pi: ExtensionAPI) {
-  pi.registerCommand("cf-setup", {
+  pi.registerCommand("cloudflare-setup", {
     description: "Configure Cloudflare Workers AI (account ID, gateway, API token)",
     handler: async (_args, ctx) => {
       const accountId = await ctx.ui.input("Cloudflare Account ID", "f009c417...");
