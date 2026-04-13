@@ -4,10 +4,10 @@ Adds Cloudflare Workers AI models to the [Pi coding agent](https://github.com/ba
 
 ## Installation
 
-1. Copy this directory into your Pi extensions folder:
+1. Install the extension:
 
    ```
-   ~/.pi/agent/extensions/cloudflare-ai-gateway/
+   pi install https://github.com/Eddayy/pi-cloudflare-ai-gateway
    ```
 
 2. Start Pi and run the setup command:
@@ -35,7 +35,7 @@ Credentials are saved to `config.json` next to `index.ts`. This file is gitignor
 
 ### Manual configuration
 
-Instead of the interactive command, you can copy `config.example.json` to `config.json` and fill in the values directly:
+Instead of the interactive command, you can manually create `config.json` in the extension directory (`~/.pi/agent/extensions/cloudflare-ai-gateway/config.json`) using `config.example.json` as a reference:
 
 ```json
 {
